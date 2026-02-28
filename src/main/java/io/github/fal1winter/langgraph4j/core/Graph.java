@@ -122,7 +122,7 @@ public class Graph<S extends State> {
      */
     public Graph<S> setMaxIterations(int maxIterations) {
         if (maxIterations <= 0) {
-            throw newmentException("Max iterations must be positive");
+            throw new IllegalArgumentException("Max iterations must be positive");
         }
         this.maxIterations = maxIterations;
         return this;
