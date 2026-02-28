@@ -12,6 +12,7 @@ A Java implementation of [LangGraph](https://github.com/langchain-ai/langgraph) 
 - 🎯 **Dynamic Routing**: Conditional branching and multi-way routing based on state
 - 🔁 **Loop Support**: Build iterative workflows with cycle detection
 - 👤 **Human-in-the-Loop**: Pause execution for human input and resume seamlessly
+- 🤖 **Auto Nodes**: LangChain-style automatic tool calling within graph orchestration
 - 💾 **State Persistence**: Built-in checkpointing with file and in-memory stores
 - 🎧 **Event Listeners**: Monitor workflow execution with lifecycle hooks
 - 🔍 **Visualization**: Generate Mermaid and DOT diagrams for workflows
@@ -210,6 +211,132 @@ String mermaid = GraphVisualizer.toMermaid(workflow);
 
 // Generate DOT format for Graphviz
 String dot = GraphVisualizer.toDot(workflow);
+```
+
+## Auto Nodes - Hybrid Approach
+
+**AutoNode** combines LangGraph's orchestration with LangChain-style automatic tool calling. The LLM can intelligently decide which tools to call, while you maintain control over the overall workflow.
+
+### Basic Usage
+
+```java
+import io.github.fal1winter.langgraph4j.agent.*;
+
+// Define tools
+class SearchTool implements Tool {
+    public String execute(Object params) {
+        return "Found papers about: " + params;
+    }
+    public String getName() { return "search"; }
+    public String getDescription() { return "Search papers"; }
+}
+
+// Create AutoNode
+AutoNode<AgentState> autoNode = AutoNode.<AgentState>builder()
+    .llm(yourLLM)  // Provide LLM implementation
+    .addTool(new SearchTool())
+    .addTool(new GetDetailTool())
+    .maxIterations(5)
+    .systemPrompt("You are a helpful assistant")
+    .build();
+
+// Use in workflow
+Graph<AgentState> workflow = Graph.<AgentState>builder()
+    .addNode("agent", autoNode)  // Auto node with tool calling
+    .addNode("validate", state -> {
+        // Manual validation step
+        return state;
+    })
+    .setEntryPoint("agent")
+    .addConditionalEdge("agent", "validate",
+        state -> state.getToolCalls().size() > 0)
+    .addEdge("validate", Graph.END);
+```
+
+### LangChain4j Integration
+
+Use existing LangChain4j `@Tool` annotated methods:
+
+```java
+import io.github.fal1winter.langgraph4j.agent.adapters.LangChain4jToolAdapter;
+
+// Your existing LangChain4j tools
+@Component
+class MyTools {
+    @Tool("Search for papers")
+    public String searchPapers(String keyword) {
+        return "Results...";
+    }
+
+    @Tool("Get paper details")
+    public String getPaper(int paperId) {
+        return "Paper info...";
+    }
+}
+
+// Convert to LangGraph4j tools
+MyTools myTools = new MyTools();
+List<Tool> tools = LangChain4jToolAdapter.fromToolsObject(myTools);
+
+// Use in AutoNode
+AutoNode<AgentState> autoNode = AutoNode.<AgentState>builder()
+    .llm(llm)
+    .tools(tools)
+    .build();
+```
+
+### When to Use AutoNode
+
+**Use AutoNode when:**
+- ✅ You want LLM to decide which tools to call
+- ✅ You need multiple tool calls in sequence
+- ✅ Tool selection logic is complex
+- ✅ You want to combine auto tool calling with manual orchestration
+
+**Use regular nodes when:**
+- ❌ Tool calling order is fixed
+- ❌ No LLM decision needed
+- ❌ Simple deterministic logic
+
+### Example: Hybrid Workflow
+
+```java
+Graph<AgentState> workflow = Graph.<AgentState>builder()
+    // Step 1: Auto node - LLM decides which tools to call
+    .addNode("research", AutoNode.<AgentState>builder()
+        .llm(llm)
+        .addTool(searchTool)
+        .addTool(getDetailTool)
+        .addTool(analyzeTool)
+        .build())
+
+    // Step 2: Manual validation
+    .addNode("validate", state -> {
+        if (state.getToolCalls().isEmpty()) {
+            state.setError("No research done");
+        }
+        return state;
+    })
+
+    // Step 3: Human approval
+    .addNode("wait_approval", state -> {
+        state.setNeedsHumanInput(true);
+        return state;
+    })
+
+    //  4: Auto node - generate final report
+    .addNode("generate_report", AutoNode.<AgentState>builder()
+        .llm(llm)
+        .addTool(formatTool)
+        .addTool(exportTool)
+        .build())
+
+    .setEntryPoint("research")
+    .addEdge("research", "validate")
+    .addConditionalEdge("validate", "wait_approval",
+        state -> !state.hasError())
+    .addEdge("wait_approval", "generate_report")
+    .addEdge("generate_report", Graph.END);
 ```
 
 ## Examples
