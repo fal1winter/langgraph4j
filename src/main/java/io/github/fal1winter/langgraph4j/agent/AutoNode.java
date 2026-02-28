@@ -21,12 +21,14 @@ public class AutoNode<S extends AgentState> implements Node<S> {
     private final List<Tool> tools;
     private final int maxIterations;
     private final String systemPrompt;
+    private final ToolExecutionPolicy policy;
 
     private AutoNode(Builder<S> builder) {
         this.llm = builder.llm;
         this.tools = builder.tools;
         this.maxIterations = builder.maxIterations;
         this.systemPrompt = builder.systemPrompt;
+        this.policy = builder.policy != null ? builder.policy : ToolExecutionPolicy.allowAll();
     }
 
     @Override
@@ -37,6 +39,7 @@ public class AutoNode<S extends AgentState> implements Node<S> {
         String prompt = buildPrompt(state);
 
         int iteration = 0;
+        int totalToolCalls = 0;
         boolean shouldContinue = true;
 
         while (shouldContinue && iteration < maxIterations) {
@@ -51,21 +54,45 @@ public class AutoNode<S extends AgentState> implements Node<S> {
 
             // Check if LLM wants to call tools
             if (response.hasToolCalls()) {
-                log.info("LLM requested {} tool calls", response.getToolCalls().size());
+                int toolCallsThisIteration = response.getToolCalls().size();
+                log.info("LLM requested {} tool calls", toolCallsThisIteration);
 
-                // Execute each tool call
+                // Check iteration limit
+                if (toolCallsThisIteration > policy.getMaxToolCallsPerIteration()) {
+                    log.warn("Tool calls ({}) exceed per-iteration limit ({})",
+                            toolCallsThisIteration, policy.getMaxToolCallsPerIteration());
+                    toolCallsThisIteration = policy.getMaxToolCallsPerIteration();
+                }
+
+                // Check total limit
+                if (totalToolCalls + toolCallsThisIteration > policy.getMaxTotalToolCalls()) {
+                    log.warn("Would exceed total tool call limit ({})", policy.getMaxTotalToolCalls());
+                    toolCallsThisIteration = policy.getMaxTotalToolCalls() - totalToolCalls;
+                }
+
+                // Execute each tool call with policy checks
                 StringBuilder toolResults = new StringBuilder();
+                int executedCount = 0;
+
                 for (ToolCallingLLM.ToolCallRequest toolCall : response.getToolCalls()) {
-                    String result = executeToolCall(state, toolCall);
-                    toolResults.append("\n[").append(toolCall.getToolName())
-                               .append(" result]: ").append(result);
+                    if (executedCount >= toolCallsThisIteration) {
+                        break;
+                    }
+
+                    String result = executeToolCallWithPolicy(state, toolCall, iteration, totalToolCalls);
+                    if (result != null) {
+                        toolResults.append("\n[").append(toolCall.getToolName())
+                                   .append(" result]: ").append(result);
+                        executedCount++;
+                        totalToolCalls++;
+                    }
                 }
 
                 // Update prompt with tool results for next iteration
                 prompt = prompt + "\n\nTool execution results:" + toolResults.toString() +
                          "\n\nBased on these results, what should we do next?";
 
-                shouldContinue = !response.isFinished();
+                shouldContinue = !response.isFinished() && totalToolCalls < policy.getMaxTotalToolCalls();
             } else {
                 // No more tool calls, we're done
                 log.info("AutoNode completed, no more tool calls");
@@ -78,16 +105,42 @@ public class AutoNode<S extends AgentState> implements Node<S> {
             state.setError("AutoNode exceeded maximum iterations");
         }
 
+        if (totalToolCalls >= policy.getMaxTotalToolCalls()) {
+            log.warn("AutoNode reached max total tool calls ({})", policy.getMaxTotalToolCalls());
+        }
+
         state.setShouldContinue(false);
         return state;
     }
 
     /**
-     * Execute a single tool call
+     * Execute a single tool call with policy checks
      */
-    private String executeToolCall(S state, ToolCallingLLM.ToolCallRequest toolCall) {
+    private String executeToolCallWithPolicy(S state, ToolCallingLLM.ToolCallRequest toolCall,
+                                            int iteration, int totalToolCalls) {
         String toolName = toolCall.getToolName();
         log.info("Executing tool: {}", toolName);
+
+        // Check if tool is allowed by policy
+        if (!policy.isToolAllowed(toolName)) {
+            String error = "Tool not allowed by policy: " + toolName;
+            log.warn(error);
+            state.addToolCall(toolName, toolCall.getParameters(), error);
+            return null; // Skip this tool
+        }
+
+        // Create context for policy checks
+        ToolExecutionPolicy.ToolCallContext context =
+            new ToolExecutionPolicy.ToolCallContext(
+                toolName, toolCall.getParameters(), iteration, totalToolCalls);
+
+        // Before execution check
+        if (!policy.beforeToolExecution(context)) {
+            String error = "Tool execution blocked by policy: " + toolName;
+            log.warn(error);
+            state.addToolCall(toolName, toolCall.getParameters(), error);
+            return null;
+        }
 
         try {
             // Find the tool
@@ -95,6 +148,7 @@ public class AutoNode<S extends AgentState> implements Node<S> {
             if (tool == null) {
                 String error = "Tool not found: " + toolName;
                 log.error(error);
+                context.setError(new IllegalArgumentException(error));
                 state.addToolCall(toolName, toolCall.getParameters(), error);
                 return error;
             }
@@ -103,6 +157,13 @@ public class AutoNode<S extends AgentState> implements Node<S> {
             String result = tool.execute(toolCall.getParameters());
             log.info("Tool {} executed successfully", toolName);
 
+            context.setResult(result);
+
+            // After execution check
+            if (!policy.afterToolExecution(context)) {
+                log.warn("Stopping execution after tool {} due to policy", toolName);
+            }
+
             // Record the tool call
             state.addToolCall(toolName, toolCall.getParameters(), result);
 
@@ -110,6 +171,7 @@ public class AutoNode<S extends AgentState> implements Node<S> {
         } catch (Exception e) {
             String error = "Tool execution failed: " + e.getMessage();
             log.error("Tool {} failed: {}", toolName, e.getMessage());
+            context.setError(e);
             state.addToolCall(toolName, toolCall.getParameters(), error);
             return error;
         }
@@ -176,6 +238,7 @@ public class AutoNode<S extends AgentState> implements Node<S> {
         private List<Tool> tools = new ArrayList<>();
         private int maxIterations = 5;
         private String systemPrompt = "";
+        private ToolExecutionPolicy policy;
 
         public Builder<S> llm(ToolCallingLLM llm) {
             this.llm = llm;
@@ -199,6 +262,11 @@ public class AutoNode<S extends AgentState> implements Node<S> {
 
         public Builder<S> systemPrompt(String systemPrompt) {
             this.systemPrompt = systemPrompt;
+            return this;
+        }
+
+        public Builder<S> policy(ToolExecutionPolicy policy) {
+            this.policy = policy;
             return this;
         }
 

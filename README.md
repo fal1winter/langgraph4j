@@ -298,6 +298,101 @@ AutoNode<AgentState> autoNode = AutoNode.<AgentState>builder()
 - ❌ No LLM decision needed
 - ❌ Simple deterministic logic
 
+### Access Control and Security
+
+**ToolExecutionPolicy** provides fine-grained control over tool execution:
+
+```java
+// 1. Whitelist - only allow safe tools
+ToolExecutionPolicy policy = ToolExecutionPolicy.builder()
+    .allowTools("search", "analyze", "read")  // Only these allowed
+    .maxTotalToolCalls(10)                    // Limit total calls
+    .maxToolCallsPerIteration(3)              // Limit per iteration
+    .build();
+
+// 2. Blacklist - deny dangerous tools
+ToolExecutionPolicy policy = ToolExecutionPolicy.builder()
+    .denyTools("delete", "modify", "execute") // Block these
+    .build();
+
+// 3. Custom hooks - advanced control
+ToolExecutionPolicy policy = ToolExecutionPolicy.builder()
+    .beforeExecute(context -> {
+        // Check permissions, rate limits, etc.
+        if (context.getTotalToolCallsSoFar() >= 5) {
+            log.warn("Too many tool calls");
+            return false; // Block execution
+        }
+        return true;
+    })
+    .afterExecute(context -> {
+        // Check results, stop on error, etc.
+        if (context.hasError()) {
+            log.error("Tool failed, stopping");
+            return false; // Stop further execution
+        }
+        return true;
+    })
+    .build();
+
+// Use in AutoNode
+AutoNode<AgentState> node = AutoNode.<AgentState>builder()
+    .llm(llm)
+    .tools(tools)
+    .policy(policy)  // Apply policy
+    .build();
+```
+
+**Policy Features:**
+- ✅ **Whitelist/Blacklist**: Control which tools can be called
+- ✅ **Rate Limiting**: Max calls per iteration and total
+- ✅ **Pre-execution Hooks**: Validate before tool execution
+- ✅ **Post-execution Hooks**: Check results and decide whether to continue
+- ✅ **Context-aware**: Access iteration number, total calls, parameters
+
+**Security Best Practices:**
+```java
+// Production-ready policy
+ToolExecutionPolicy productionPolicy = ToolExecutionPolicy.builder()
+    // Only allow read-only tools
+    .allowTools("search", "get", "analyze", "read")
+
+    // Prevent abuse
+    .maxToolCallsPerIteration(3)
+    .maxTotalToolCalls(20)
+
+    // Validate before execution
+    .beforeExecute(context -> {
+        // Check user permissions
+        if (!hasPermission(context.getToolName())) {
+            return false;
+        }
+
+        // Rate limiting
+        if (isRateLimited(userId)) {
+            return false;
+        }
+
+        return true;
+    })
+
+    // Monitor after execution
+    .afterExecute(context -> {
+        // Log for audit
+        auditLog.record(context);
+
+        // Stop on sensitive errors
+        if (context.hasError() && isSensitiveError(context.getError())) {
+            return false;
+        }
+
+        return true;
+    })
+    .build();
+```
+
+### When to Use AutoNode
+
 ### Example: Hybrid Workflow
 
 ```java
